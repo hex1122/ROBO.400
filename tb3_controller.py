@@ -1,9 +1,34 @@
 #!/usr/bin/env python3
+"""
+TB3 controller for Tasks 2.2 + 3
+- Supports: goto_xy, goto_pose, follow_path (CLI) and ONLINE goals via topics
+- Publishes status logs (rqt_console) and error topics (rqt_plot / rosbag2)
+- Simple P-style controller with preemption
+
+Usage examples:
+  # Start sim in another terminal first (waffle_pi world)
+  # Then run controller (idle): 
+  python3 tb3_controller.py
+
+  # Or start with a CLI goal:
+  python3 tb3_controller.py goto_xy --x 1.0 --y 0.0
+
+  # Send goals online from another terminal:
+  ros2 topic pub -1 /tb3/goal_xy geometry_msgs/Point "{x: 1.0, y: 0.0, z: 0.0}"
+  ros2 topic pub -1 /tb3/goal_pose2d geometry_msgs/Pose2D "{x: 0.0, y: 0.0, theta: 1.5708}"
+  # Path (nav_msgs/Path) example shown in earlier messages.
+"""
+
+
 import math, sys, argparse
 import rclpy
 from rclpy.node import Node
+# ROS messages we use 
 from geometry_msgs.msg import Twist, Point, Pose2D, PoseStamped
 from nav_msgs.msg import Odometry, Path
+
+#Error topics for rqt_plot + rosbag:
+from std_msgs.msg import Float32, Float32MultiArray, Int32
 
 def yaw_from_quat(q):
     # geometry_msgs/Quaternion -> yaw (Z)
@@ -17,10 +42,19 @@ class TB3Controller(Node):
         # I/O
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
-        # NEW: runtime goal interfaces
+        # runtime interfaces
         self.create_subscription(Point, '/tb3/goal_xy', self.cb_goal_xy, 10)
         self.create_subscription(Pose2D, '/tb3/goal_pose2d', self.cb_goal_pose2d, 10)
         self.create_subscription(Path, '/tb3/path', self.cb_path, 10)
+
+        # Publish errors so they can be plotted/recorded 
+        # /tb3/error/distance: Float32 (meters)
+        self.err_dist_pub = self.create_publisher(Float32, '/tb3/error/distance', 10)
+        # /tb3/error/pose: Float32MultiArray -> [distance (m), yaw_error (rad)]
+        self.err_pose_pub = self.create_publisher(Float32MultiArray, '/tb3/error/pose', 10)
+        # (optional) publish current waypoint index during follow_path
+        self.wp_idx_pub = self.create_publisher(Int32, '/tb3/path_wp_idx', 10)
+
 
         self.timer = self.create_timer(0.05, self.loop)  # 20 Hz
         self.pose = None
@@ -43,7 +77,7 @@ class TB3Controller(Node):
 
         self.get_logger().info(f"Mode: {self.state}")
 
-    # ---- Subscriptions ----
+    #  Subscriptions
     def odom_cb(self, msg: Odometry):
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
@@ -79,9 +113,18 @@ class TB3Controller(Node):
         self.state = 'follow_path'
         self.get_logger().info(f"Preempted: new path with {len(self.path)} waypoints")
 
-    # ---- Motion loop ----
+    # Motion loop 
     def stop(self):
         self.cmd_pub.publish(Twist())
+
+    #TASK 3 helper to publish errors every control cycle
+    def publish_errors(self, dist: float, yaw_err: float):
+        """Publish error signals for evaluation/plots."""
+        self.err_dist_pub.publish(Float32(data=float(dist)))
+        arr = Float32MultiArray(); arr.data = [float(dist), float(yaw_err)]
+        self.err_pose_pub.publish(arr)
+   
+
 
     def loop(self):
         if self.pose is None or self.state == 'idle':
@@ -93,6 +136,10 @@ class TB3Controller(Node):
             rho = math.hypot(dx, dy)
             target_yaw = math.atan2(dy, dx)
             yaw_err = (target_yaw - yaw + math.pi) % (2*math.pi) - math.pi
+
+            # TASK 3 publish distance & yaw error for plotting
+            self.publish_errors(rho, yaw_err)
+
             if rho < tol:
                 return True, Twist()
             cmd = Twist()
@@ -115,6 +162,10 @@ class TB3Controller(Node):
                 self.cmd_pub.publish(cmd)
             else:
                 yaw_err = (gth - yaw + math.pi) % (2*math.pi) - math.pi
+
+                 #  TASK 3 still publish yaw error during final align
+                self.publish_errors(0.0, yaw_err)
+        
                 if abs(yaw_err) < 0.03:
                     self.get_logger().info("Reached full pose (x,y,theta).")
                     self.stop(); self.state = 'idle'
@@ -130,6 +181,12 @@ class TB3Controller(Node):
                 self.cmd_pub.publish(cmd)
             else:
                 self.wp_index += 1
+
+
+                #TASK 3 publish waypoint index so it’s visible in plots
+                self.wp_idx_pub.publish(Int32(data=self.wp_index))
+
+
                 if self.wp_index >= len(self.path):
                     self.get_logger().info("Finished path.")
                     self.stop(); self.state = 'idle'
