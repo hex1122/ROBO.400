@@ -2,42 +2,84 @@
 import math, sys, argparse
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
-from tf_transformations import euler_from_quaternion
+from geometry_msgs.msg import Twist, Point, Pose2D, PoseStamped
+from nav_msgs.msg import Odometry, Path
 
 def yaw_from_quat(q):
-    return euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+    # geometry_msgs/Quaternion -> yaw (Z)
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 class TB3Controller(Node):
     def __init__(self, args):
         super().__init__('tb3_controller')
+        # I/O
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
+        # NEW: runtime goal interfaces
+        self.create_subscription(Point, '/tb3/goal_xy', self.cb_goal_xy, 10)
+        self.create_subscription(Pose2D, '/tb3/goal_pose2d', self.cb_goal_pose2d, 10)
+        self.create_subscription(Path, '/tb3/path', self.cb_path, 10)
+
         self.timer = self.create_timer(0.05, self.loop)  # 20 Hz
         self.pose = None
-        self.args = args
         self.state = 'idle'
+        self.goal = None
+        self.path = None
         self.wp_index = 0
 
+        # CLI modes remain supported
         if args.mode == 'goto_xy':
-            self.goal = (args.x, args.y, None)
-            self.state = 'goto_xy'
+            self.goal = (args.x, args.y, None); self.state = 'goto_xy'
         elif args.mode == 'goto_pose':
-            self.goal = (args.x, args.y, args.theta)
-            self.state = 'goto_pose'
+            self.goal = (args.x, args.y, args.theta); self.state = 'goto_pose'
         elif args.mode == 'follow_path':
             self.path = [(x, y) for x, y in zip(args.xs, args.ys)]
-            self.goal = self.path[0]
-            self.state = 'follow_path'
+            if not self.path:
+                self.get_logger().error("Empty path"); self.state='idle'
+            else:
+                self.goal = self.path[0]; self.state = 'follow_path'
 
-        self.get_logger().info(f"Mode: {self.state}. Goal(s) set.")
+        self.get_logger().info(f"Mode: {self.state}")
 
+    # ---- Subscriptions ----
     def odom_cb(self, msg: Odometry):
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
         self.pose = (p.x, p.y, yaw_from_quat(q))
 
+    def cb_goal_xy(self, msg: Point):
+        self.stop()
+        self.path = None
+        self.goal = (float(msg.x), float(msg.y), None)
+        self.wp_index = 0
+        self.state = 'goto_xy'
+        self.get_logger().info(f"Preempted: new goto_xy -> ({msg.x:.3f}, {msg.y:.3f})")
+
+    def cb_goal_pose2d(self, msg: Pose2D):
+        self.stop()
+        self.path = None
+        self.goal = (float(msg.x), float(msg.y), float(msg.theta))
+        self.wp_index = 0
+        self.state = 'goto_pose'
+        self.get_logger().info(f"Preempted: new goto_pose -> ({msg.x:.3f}, {msg.y:.3f}, {msg.theta:.3f})")
+
+    def cb_path(self, msg: Path):
+        self.stop()
+        pts = []
+        for ps in msg.poses:
+            pts.append((float(ps.pose.position.x), float(ps.pose.position.y)))
+        if not pts:
+            self.get_logger().warn("Received empty Path; staying idle")
+            return
+        self.path = pts
+        self.wp_index = 0
+        self.goal = self.path[0]
+        self.state = 'follow_path'
+        self.get_logger().info(f"Preempted: new path with {len(self.path)} waypoints")
+
+    # ---- Motion loop ----
     def stop(self):
         self.cmd_pub.publish(Twist())
 
@@ -46,8 +88,6 @@ class TB3Controller(Node):
             return
 
         x, y, yaw = self.pose
-        cmd = Twist()
-
         def go_to_xy(gx, gy, lin_k=0.8, ang_k=2.0, tol=0.05):
             dx, dy = gx - x, gy - y
             rho = math.hypot(dx, dy)
@@ -56,7 +96,7 @@ class TB3Controller(Node):
             if rho < tol:
                 return True, Twist()
             cmd = Twist()
-            cmd.linear.x = max(min(lin_k * rho, 0.25), -0.25)
+            cmd.linear.x  = max(min(lin_k * rho, 0.25), -0.25)
             cmd.angular.z = max(min(ang_k * yaw_err, 1.5), -1.5)
             return False, cmd
 
@@ -64,24 +104,20 @@ class TB3Controller(Node):
             done, cmd = go_to_xy(self.goal[0], self.goal[1])
             if done:
                 self.get_logger().info("Reached XY goal.")
-                self.stop()
-                self.state = 'idle'
+                self.stop(); self.state = 'idle'
             else:
                 self.cmd_pub.publish(cmd)
 
         elif self.state == 'goto_pose':
             gx, gy, gth = self.goal
-            # Stage 1: go to point
             done, cmd = go_to_xy(gx, gy, tol=0.06)
             if not done:
                 self.cmd_pub.publish(cmd)
             else:
-                # Stage 2: align heading
                 yaw_err = (gth - yaw + math.pi) % (2*math.pi) - math.pi
                 if abs(yaw_err) < 0.03:
                     self.get_logger().info("Reached full pose (x,y,theta).")
-                    self.stop()
-                    self.state = 'idle'
+                    self.stop(); self.state = 'idle'
                 else:
                     turn = Twist()
                     turn.angular.z = max(min(2.0 * yaw_err, 1.2), -1.2)
@@ -96,15 +132,14 @@ class TB3Controller(Node):
                 self.wp_index += 1
                 if self.wp_index >= len(self.path):
                     self.get_logger().info("Finished path.")
-                    self.stop()
-                    self.state = 'idle'
+                    self.stop(); self.state = 'idle'
                 else:
                     self.goal = self.path[self.wp_index]
                     self.get_logger().info(f"Next waypoint {self.wp_index}/{len(self.path)}: {self.goal}")
 
 def parse_args(argv):
     ap = argparse.ArgumentParser()
-    sub = ap.add_subparsers(dest='mode', required=True)
+    sub = ap.add_subparsers(dest='mode', required=False)
 
     s1 = sub.add_parser('goto_xy')
     s1.add_argument('--x', type=float, required=True)
@@ -113,8 +148,7 @@ def parse_args(argv):
     s2 = sub.add_parser('goto_pose')
     s2.add_argument('--x', type=float, required=True)
     s2.add_argument('--y', type=float, required=True)
-    s2.add_argument('--theta', type=float, required=True,
-                    help='heading in radians')
+    s2.add_argument('--theta', type=float, required=True, help='heading in radians')
 
     s3 = sub.add_parser('follow_path')
     s3.add_argument('--xs', type=float, nargs='+', required=True)
